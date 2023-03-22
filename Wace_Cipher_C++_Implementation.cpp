@@ -20,15 +20,16 @@ int main() {
     case 1: {
         cout << "\n[You have chosen 1 for encryption]\n\n";
 
-        string k, pt, dhKey, pass;
+        string k, pt, pass;
+        int dhKey;
         cout << "Enter a random keyword: ";
-        cin >> k;
+        getline(cin >> ws, k);
         cout << "Enter Diffie-Hellman secret number: ";
         cin >> dhKey;
         cout << "Enter the plaintext: ";
         getline(cin >> ws, pt);
 
-        pass = k + dhKey;
+        pass = k + to_string(dhKey);
 
         /////////////////////// GENERATING A BINARY TRANSPOSITION KEY ///////////////////////
 
@@ -64,13 +65,11 @@ int main() {
             int passASCII = int(pass[i % pass.length()]);
             // Get the ASCII value of the current character in the plaintext
             int ptASCII = int(pt[i]);
-            // Add the ASCII values of the plaintext and key characters
-            int ctASCII = ((ptASCII + passASCII) % 95) + 32;
+            // Perform plaintext ASCII manipulation using password ASCII and Diffie-Hellman secret number
+            int ctASCII = ((ptASCII + passASCII + dhKey) % 95) + 32;
             // Convert the result back into a character and add it to the ciphertext
             ct += char(ctASCII);
         }
-
-        //cout << "\nSubstitut ciphertext: " << ct;
 
         ////////////////////////// TEXT TRANSPOSITION //////////////////////////////
 
@@ -107,15 +106,16 @@ int main() {
     case 2: {
         cout << "\n[You have chosen 2 for decryption]\n\n";
 
-        string k, ct, dhKey, pass;
+        string k, ct, pass;
+        int dhKey;
         cout << "Enter the keyword: ";
-        cin >> k;
+        getline(cin >> ws, k);
         cout << "Enter Diffie-Hellman secret number: ";
         cin >> dhKey;
         cout << "Enter the ciphertext: ";
         getline(cin >> ws, ct);
 
-        pass = k + dhKey;
+        pass = k + to_string(dhKey);
 
         /////////////////////// GENERATING A BINARY TRANSPOSITION KEY ///////////////////////
 
@@ -197,12 +197,15 @@ int main() {
             // Get the ASCII value of the current character in the ciphertext
             int sptASCII = int(spt[i]);
             // Reverse the encryption processes
-            int ptASCII = (sptASCII + 63) - passASCII;
-            if (ptASCII < 32) {
-                ptASCII = ptASCII + 95;
-            }
-            else if (ptASCII > 126) {
-                ptASCII = ptASCII - 95;
+            int ptASCII = (sptASCII + 63) - (passASCII + dhKey);
+            cout << to_string(ptASCII) + " ";
+            while (ptASCII < 32 || ptASCII > 126) {
+                if (ptASCII < 32) {
+                    ptASCII += 95;
+                }
+                else if (ptASCII > 126) {
+                    ptASCII -= 95;
+                }
             }
             // Convert the result back into a character and add it to the plaintext
             opt += char(ptASCII);
