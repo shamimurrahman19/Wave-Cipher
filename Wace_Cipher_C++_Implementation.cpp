@@ -90,8 +90,6 @@ int main() {
             }
         }
 
-
-
         // Print the characters from section1 and section2 respectively
         string tct;
         cout << "\nCiphertext: ";
