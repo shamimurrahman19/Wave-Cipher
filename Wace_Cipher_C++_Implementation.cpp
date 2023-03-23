@@ -196,7 +196,6 @@ int main() {
             int sptASCII = int(spt[i]);
             // Reverse the encryption processes
             int ptASCII = (sptASCII + 63) - (passASCII + dhKey);
-            cout << to_string(ptASCII) + " ";
             while (ptASCII < 32 || ptASCII > 126) {
                 if (ptASCII < 32) {
                     ptASCII += 95;
