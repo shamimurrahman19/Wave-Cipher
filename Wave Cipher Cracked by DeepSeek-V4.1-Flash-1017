@@ -1,0 +1,575 @@
+// wave_pair_cracker.cpp
+//
+// Two-time-pad attack against the "Wave Cipher".
+// Input: two ciphertexts encrypted with the SAME password and dhKey.
+//
+// Updated logic:
+//   - Does not stop at the first checksum-valid candidate.
+//   - Collects all single-/two-column corrections, then ranks them.
+//   - This avoids accepting a 12-bit checksum collision that still
+//     decrypts to near-English text.
+//
+// Build:
+//   g++ -O2 -std=c++17 wave_pair_cracker.cpp -o wave_pair_cracker
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <climits>
+#include <cmath>
+#include <iomanip>
+#include <iostream>
+#include <set>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+// ---------- cipher primitives ----------
+
+int residueToAscii(int r) {
+    r %= 95;
+    if (r < 0) r += 95;
+    return r >= 32 ? r : r + 95;
+}
+
+string makeEtk(const string& tk, size_t n) {
+    size_t rem = n % 12;
+    if (rem == 0) return tk + tk.substr(1);
+    return tk + tk.substr(1, rem - 1);
+}
+
+string untranspose(const string& ct, int tkInt) {
+    string tk;
+    tk.reserve(12);
+    for (int i = 11; i >= 0; --i)
+        tk.push_back(((tkInt >> i) & 1) ? '1' : '0');
+
+    string etk = makeEtk(tk, ct.size());
+
+    vector<size_t> order;
+    order.reserve(ct.size());
+
+    for (size_t i = 0; i < ct.size(); ++i)
+        if (etk[i % etk.size()] == '1') order.push_back(i);
+    for (size_t i = 0; i < ct.size(); ++i)
+        if (etk[i % etk.size()] == '0') order.push_back(i);
+
+    string u(ct.size(), ' ');
+    for (size_t k = 0; k < ct.size(); ++k)
+        u[order[k]] = ct[k];
+
+    return u;
+}
+
+int checksumOf(const string& pass) {
+    long long sum = 0;
+    for (unsigned char c : pass) sum += c;
+    return int(sum % 4096);
+}
+
+string decryptWithKey(const string& pass, int dh, const string& ct) {
+    int tk = checksumOf(pass);
+    string u = untranspose(ct, tk);
+
+    string pt;
+    pt.reserve(u.size());
+
+    for (size_t i = 0; i < u.size(); ++i) {
+        int p = int((unsigned char)u[i]) + 63 -
+                (int((unsigned char)pass[i % pass.size()]) + dh);
+        while (p < 32) p += 95;
+        while (p > 126) p -= 95;
+        pt.push_back(char(p));
+    }
+
+    return pt;
+}
+
+// ---------- statistical model ----------
+
+struct Model {
+    array<double, 128> logChar{};
+    array<double, 95> logDiff{};
+};
+
+Model buildModel() {
+    Model m;
+
+    array<double, 128> pChar{};
+    pChar.fill(1e-7);
+
+    auto setP = [&](char c, double p) {
+        pChar[(unsigned char)c] = p;
+    };
+
+    // Approximate English letter frequencies, scaled to ~0.75.
+    const char letters[] = "etaoinshrdlucmfwypvbgkjqxz";
+    const double freq[] = {
+        0.1270, 0.0906, 0.0817, 0.0751, 0.0697, 0.0675, 0.0633,
+        0.0609, 0.0599, 0.0425, 0.0403, 0.0276, 0.0278, 0.0241,
+        0.0236, 0.0223, 0.0202, 0.0197, 0.0192, 0.0149, 0.0098,
+        0.0077, 0.0015, 0.0010, 0.0007, 0.0001
+    };
+    for (int i = 0; i < 26; ++i)
+        setP(letters[i], freq[i] * 0.75);
+
+    setP(' ', 0.18);
+    setP(',', 0.012);
+    setP('.', 0.012);
+    setP('\'', 0.006);
+    setP('?', 0.002);
+    setP('!', 0.002);
+
+    for (char c = 'A'; c <= 'Z'; ++c) setP(c, 0.0015);
+    for (char c = '0'; c <= '9'; ++c) setP(c, 0.001);
+    for (char c : string(":;()-")) setP(c, 0.002);
+
+    // Residue distribution over the 95 printable characters.
+    array<double, 95> pRes{};
+    pRes.fill(0.0);
+
+    for (int c = 32; c <= 126; ++c)
+        pRes[c % 95] += pChar[c];
+
+    double sum = 0.0;
+    for (double v : pRes) sum += v;
+    for (double& v : pRes) v /= sum;
+
+    // Probability of the difference of two independent English characters.
+    for (int d = 0; d < 95; ++d) {
+        double p = 0.0;
+        for (int r = 0; r < 95; ++r)
+            p += pRes[r] * pRes[(r - d + 95) % 95];
+        m.logDiff[d] = log(max(p, 1e-15));
+    }
+
+    for (int c = 0; c < 128; ++c)
+        m.logChar[c] = log(max(pChar[c], 1e-15));
+
+    return m;
+}
+
+// ---------- candidate structures ----------
+
+struct TkScore {
+    int tk;
+    double score;
+};
+
+struct PeriodScore {
+    int P;
+    double score;
+    long long pairs;
+};
+
+struct ShiftScore {
+    int shift;
+    double score;
+};
+
+struct KeyCandidate {
+    string pass;
+    string keyword;
+    int dh = 0;
+    double score = 0.0;
+    string pt1;
+    string pt2;
+};
+
+// ---------- ranking helpers ----------
+
+// Scores each 12-bit transposition using the two-time-pad difference.
+vector<TkScore> rankTks(const string& ct1, const string& ct2,
+                        const Model& model, int keep) {
+    vector<TkScore> all;
+    all.reserve(4096);
+
+    const int m = int(min(ct1.size(), ct2.size()));
+    const double uniformLift = log(95.0);
+
+    for (int tk = 0; tk < 4096; ++tk) {
+        string u1 = untranspose(ct1, tk);
+        string u2 = untranspose(ct2, tk);
+
+        double score = 0.0;
+        for (int i = 0; i < m; ++i) {
+            int d = (int((unsigned char)u1[i]) - int((unsigned char)u2[i])) % 95;
+            if (d < 0) d += 95;
+            score += model.logDiff[d] + uniformLift;
+        }
+
+        all.push_back({tk, score});
+    }
+
+    sort(all.begin(), all.end(),
+         [](const TkScore& a, const TkScore& b) { return a.score > b.score; });
+
+    if (int(all.size()) > keep) all.resize(keep);
+    return all;
+}
+
+// Combined per-column IoC for both untransposed texts.
+vector<PeriodScore> rankPeriods(const string& u1, const string& u2, int maxP) {
+    vector<PeriodScore> out;
+
+    for (int P = 1; P <= maxP; ++P) {
+        long long num = 0;
+        long long den = 0;
+
+        for (int j = 0; j < P; ++j) {
+            array<int, 128> cnt{};
+            int m = 0;
+
+            for (size_t i = j; i < u1.size(); i += P) {
+                ++cnt[(unsigned char)u1[i]];
+                ++m;
+            }
+            for (size_t i = j; i < u2.size(); i += P) {
+                ++cnt[(unsigned char)u2[i]];
+                ++m;
+            }
+
+            if (m >= 2) {
+                for (int c = 0; c < 128; ++c) {
+                    long long f = cnt[c];
+                    num += f * (f - 1);
+                }
+                den += 1LL * m * (m - 1);
+            }
+        }
+
+        if (den > 0)
+            out.push_back({P, double(num) / double(den), den / 2});
+    }
+
+    sort(out.begin(), out.end(),
+         [](const PeriodScore& a, const PeriodScore& b) { return a.score > b.score; });
+
+    return out;
+}
+
+// For each column, scores all 95 possible shifts and keeps the best K.
+vector<vector<ShiftScore>> rankShifts(const string& u1, const string& u2,
+                                      int P, const Model& model, int K) {
+    vector<vector<ShiftScore>> out(P);
+
+    for (int j = 0; j < P; ++j) {
+        vector<ShiftScore> cand;
+        cand.reserve(95);
+
+        for (int s = 0; s < 95; ++s) {
+            double score = 0.0;
+
+            for (size_t i = j; i < u1.size(); i += P) {
+                int pIdx = (((int((unsigned char)u1[i]) - 32 - s) % 95) + 95) % 95;
+                score += model.logChar[residueToAscii(pIdx)];
+            }
+            for (size_t i = j; i < u2.size(); i += P) {
+                int pIdx = (((int((unsigned char)u2[i]) - 32 - s) % 95) + 95) % 95;
+                score += model.logChar[residueToAscii(pIdx)];
+            }
+
+            cand.push_back({s, score});
+        }
+
+        sort(cand.begin(), cand.end(),
+             [](const ShiftScore& a, const ShiftScore& b) { return a.score > b.score; });
+
+        if (int(cand.size()) > K) cand.resize(K);
+        out[j] = cand;
+    }
+
+    return out;
+}
+
+// If the keystream repeats inside a larger candidate period,
+// reduce it to the smallest repeating block.
+vector<int> reducePeriod(const vector<int>& shifts) {
+    const int P = int(shifts.size());
+
+    for (int d = 1; d < P; ++d) {
+        if (P % d != 0) continue;
+
+        bool ok = true;
+        for (int j = 0; j < P; ++j) {
+            if (shifts[j] != shifts[j % d]) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return vector<int>(shifts.begin(), shifts.begin() + d);
+    }
+
+    return shifts;
+}
+
+// ---------- key derivation ----------
+
+// Given a shift vector and a candidate 12-bit checksum, recover any pass
+// whose last D characters are the decimal digits of dhKey.
+vector<KeyCandidate> deriveKeys(const vector<int>& shifts, int tkInt) {
+    vector<KeyCandidate> out;
+    const int P = int(shifts.size());
+
+    for (int R = 0; R < 95; ++R) {
+        string pass;
+        pass.reserve(P);
+
+        for (int s : shifts)
+            pass.push_back(char(residueToAscii((s - R) % 95)));
+
+        for (int D = 1; D <= min(10, P); ++D) {
+            string tail = pass.substr(P - D);
+
+            bool allDigits = true;
+            for (char c : tail) {
+                if (!isdigit((unsigned char)c)) {
+                    allDigits = false;
+                    break;
+                }
+            }
+            if (!allDigits) continue;
+
+            long long dhLL = 0;
+            try {
+                dhLL = stoll(tail);
+            } catch (...) {
+                continue;
+            }
+            if (dhLL > INT_MAX) continue;
+
+            int dh = int(dhLL);
+            if (to_string(dh) != tail) continue;          // no leading zeros
+            if (((dh % 95) + 95) % 95 != R) continue;     // dhKey mod 95
+            if (checksumOf(pass) != tkInt) continue;      // 12-bit checksum
+
+            KeyCandidate k;
+            k.pass = pass;
+            k.keyword = pass.substr(0, P - D);
+            k.dh = dh;
+            out.push_back(k);
+        }
+    }
+
+    return out;
+}
+
+// ---------- plaintext scoring ----------
+
+double textScore(const string& s, const Model& m) {
+    double score = 0.0;
+    int good = 0;
+
+    for (unsigned char c : s) {
+        score += m.logChar[c];
+        if (islower(c) || isupper(c) || isdigit(c) || c == ' ' ||
+            c == ',' || c == '.' || c == '\'' || c == '?' || c == '!' ||
+            c == ':' || c == ';' || c == '-')
+            ++good;
+    }
+
+    score += 0.25 * good;
+
+    for (unsigned char c : s)
+        if (c == ' ') score += 0.5;
+
+    return score;
+}
+
+double textQuality(const string& s) {
+    if (s.empty()) return 0.0;
+
+    int good = 0;
+    for (unsigned char c : s) {
+        if (isalnum(c) || c == ' ' || c == ',' || c == '.' || c == '\'' ||
+            c == '?' || c == '!' || c == ':' || c == ';' || c == '-' ||
+            c == '(' || c == ')')
+            ++good;
+    }
+    return double(good) / double(s.size());
+}
+
+// Derive keys for a shift vector, decrypt both ciphertexts, and score them.
+void evaluateShifts(const vector<int>& shifts, int tkInt,
+                    const string& ct1, const string& ct2,
+                    const Model& model,
+                    vector<KeyCandidate>& results,
+                    set<string>& seenPass) {
+    vector<KeyCandidate> keys = deriveKeys(shifts, tkInt);
+
+    for (KeyCandidate& k : keys) {
+        if (!seenPass.insert(k.pass).second) continue;
+
+        k.pt1 = decryptWithKey(k.pass, k.dh, ct1);
+        k.pt2 = decryptWithKey(k.pass, k.dh, ct2);
+        k.score = textScore(k.pt1, model) + textScore(k.pt2, model);
+
+        results.push_back(k);
+    }
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    string ct1;
+    string ct2;
+
+    cout << "Ciphertext 1: ";
+    getline(cin, ct1);
+    cout << "Ciphertext 2: ";
+    getline(cin, ct2);
+
+    if (ct1.empty() || ct2.empty()) {
+        cerr << "Two non-empty ciphertexts are required.\n";
+        return 1;
+    }
+
+    const Model model = buildModel();
+
+    // Step 1: identify the shared 12-bit transposition key.
+    vector<TkScore> tks = rankTks(ct1, ct2, model, 20);
+
+    cout << "\nTop transposition candidates (log-lift in bits):\n";
+    for (const TkScore& t : tks) {
+        cout << "  tk=" << t.tk
+             << "  bits=" << fixed << setprecision(1)
+             << (t.score / log(2.0)) << "\n";
+    }
+
+    vector<KeyCandidate> results;
+    set<string> seenPass;
+    bool solved = false;
+
+    const int tksToTry = int(min<size_t>(10, tks.size()));
+
+    for (int ti = 0; ti < tksToTry && !solved; ++ti) {
+        const int tkInt = tks[ti].tk;
+        const string u1 = untranspose(ct1, tkInt);
+        const string u2 = untranspose(ct2, tkInt);
+
+        const int maxP = int(min<size_t>(60, max(ct1.size(), ct2.size())));
+        vector<PeriodScore> periods = rankPeriods(u1, u2, maxP);
+
+        double bestScore = 0.0;
+        for (const PeriodScore& p : periods)
+            if (p.pairs >= 50)
+                bestScore = max(bestScore, p.score);
+        if (bestScore == 0.0)
+            for (const PeriodScore& p : periods)
+                bestScore = max(bestScore, p.score);
+
+        vector<PeriodScore> tryPeriods;
+        for (const PeriodScore& p : periods) {
+            if (p.pairs < 40) continue;
+            if (p.score >= max(0.045, 0.75 * bestScore))
+                tryPeriods.push_back(p);
+        }
+
+        for (int i = 0; i < int(min<size_t>(8, periods.size())); ++i)
+            tryPeriods.push_back(periods[i]);
+
+        sort(tryPeriods.begin(), tryPeriods.end(),
+             [](const PeriodScore& a, const PeriodScore& b) { return a.P < b.P; });
+
+        vector<int> seenPeriod;
+        int periodsTried = 0;
+
+        for (const PeriodScore& ps : tryPeriods) {
+            if (solved || periodsTried >= 6) break;
+
+            if (find(seenPeriod.begin(), seenPeriod.end(), ps.P) != seenPeriod.end())
+                continue;
+            seenPeriod.push_back(ps.P);
+            ++periodsTried;
+
+            const int P = ps.P;
+            vector<vector<ShiftScore>> ranked = rankShifts(u1, u2, P, model, 12);
+
+            vector<int> base(P);
+            for (int j = 0; j < P; ++j)
+                base[j] = ranked[j][0].shift;
+
+            evaluateShifts(base, tkInt, ct1, ct2, model, results, seenPass);
+
+            vector<int> reduced = reducePeriod(base);
+            if (reduced.size() != base.size())
+                evaluateShifts(reduced, tkInt, ct1, ct2, model, results, seenPass);
+
+            // Frequency analysis is not perfect with short columns.
+            // Collect EVERY checksum-valid candidate. Do not stop at the
+            // first one: the 12-bit checksum can collide, and a wrong
+            // collision can decrypt to near-English text.
+            for (int j = 0; j < P; ++j) {
+                for (int s = 0; s < 95; ++s) {
+                    if (s == base[j]) continue;
+
+                    vector<int> vec = base;
+                    vec[j] = s;
+                    evaluateShifts(vec, tkInt, ct1, ct2, model, results, seenPass);
+                }
+            }
+
+            if (!results.empty()) {
+                solved = true;
+                break;
+            }
+
+            // If no single-column correction validated, try pairs of
+            // columns using the top few shifts per column.
+            const int K = 6;
+
+            for (int j1 = 0; j1 < P; ++j1) {
+                for (int j2 = j1 + 1; j2 < P; ++j2) {
+                    int n1 = min<int>(K, ranked[j1].size());
+                    int n2 = min<int>(K, ranked[j2].size());
+
+                    for (int a = 0; a < n1; ++a) {
+                        for (int b = 0; b < n2; ++b) {
+                            if (a == 0 && b == 0) continue;
+
+                            vector<int> vec = base;
+                            vec[j1] = ranked[j1][a].shift;
+                            vec[j2] = ranked[j2][b].shift;
+
+                            evaluateShifts(vec, tkInt, ct1, ct2, model, results, seenPass);
+                        }
+                    }
+                }
+            }
+
+            if (!results.empty()) {
+                solved = true;
+                break;
+            }
+        }
+    }
+
+    if (!results.empty()) {
+        sort(results.begin(), results.end(),
+             [](const KeyCandidate& a, const KeyCandidate& b) { return a.score > b.score; });
+
+        cout << "\n=== RECOVERED CANDIDATES ===\n";
+
+        int shown = 0;
+        for (const KeyCandidate& k : results) {
+            cout << "\npass      : " << k.pass << "\n";
+            cout << "keyword   : " << k.keyword << "\n";
+            cout << "dhKey     : " << k.dh << "\n";
+            cout << "checksum  : " << checksumOf(k.pass) << "\n";
+            cout << "plaintext1: " << k.pt1 << "\n";
+            cout << "plaintext2: " << k.pt2 << "\n";
+            cout << "textScore : " << fixed << setprecision(2) << k.score
+                 << "  quality: "
+                 << textQuality(k.pt1) << " / " << textQuality(k.pt2) << "\n";
+
+            if (++shown >= 5) break;
+        }
+    } else {
+        cout << "\nNo checksum-valid key was found.\n";
+        cout << "Try a longer pair, a known plaintext fragment, or adjust the model.\n";
+    }
+
+    return 0;
+}
